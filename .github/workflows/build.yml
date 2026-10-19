@@ -22,9 +22,21 @@ jobs:
           git checkout c42995caff0144f37ad9791dc9bc96d82e8a6f65
           git submodule update --init --recursive
 
+      - name: Find the control files (wherever they were uploaded)
+        run: |
+          PATCH=$(find "$GITHUB_WORKSPACE" -name apply_mph.py -not -path "*/src/*" | head -1)
+          if [ -z "$PATCH" ]; then echo "apply_mph.py is missing from the repo"; exit 1; fi
+          MPH_DIR=$(dirname "$PATCH")
+          echo "Using files in $MPH_DIR"
+          ls -la "$MPH_DIR"
+          for f in MphOverlayView.kt release.keystore; do
+            [ -f "$MPH_DIR/$f" ] || { echo "$f must be in the same folder as apply_mph.py"; exit 1; }
+          done
+          echo "MPH_DIR=$MPH_DIR" >> "$GITHUB_ENV"
+
       - name: Apply Hunters controls
         working-directory: src
-        run: python3 ../mph/apply_mph.py ../mph
+        run: python3 "$MPH_DIR/apply_mph.py" "$MPH_DIR"
 
       - uses: actions/setup-java@v4
         with:
@@ -38,7 +50,7 @@ jobs:
       - name: Build APK
         working-directory: src
         run: |
-          echo "MELONDS_KEYSTORE=$GITHUB_WORKSPACE/mph/release.keystore" >> local.properties
+          echo "MELONDS_KEYSTORE=$MPH_DIR/release.keystore" >> local.properties
           echo "MELONDS_KEYSTORE_PASSWORD=hunters123" >> local.properties
           echo "MELONDS_KEY_ALIAS=melonds" >> local.properties
           echo "MELONDS_KEY_PASSWORD=hunters123" >> local.properties
