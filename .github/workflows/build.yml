@@ -44,8 +44,13 @@ jobs:
           distribution: zulu
           cache: gradle
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Prepare Android SDK (already on the runner)
+        run: |
+          echo "Android SDK at $ANDROID_HOME"
+          SDKM="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin | sort -V | tail -1)/sdkmanager"
+          echo "Using $SDKM"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" --install "ndk;28.0.13004108" "cmake;3.22.1"
 
       - name: Build APK
         working-directory: src
