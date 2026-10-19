@@ -1,0 +1,63 @@
+name: Build melonDS Hunters APK
+
+on:
+  push:
+    branches: [ '**' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get this repo (controls + patch)
+        uses: actions/checkout@v4
+
+      - name: Get melonDS Android source (pinned version)
+        run: |
+          git clone https://github.com/rafaelvcaetano/melonDS-android.git src
+          cd src
+          git checkout c42995caff0144f37ad9791dc9bc96d82e8a6f65
+          git submodule update --init --recursive
+
+      - name: Apply Hunters controls
+        working-directory: src
+        run: python3 ../mph/apply_mph.py ../mph
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: zulu
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Build APK
+        working-directory: src
+        run: |
+          echo "MELONDS_KEYSTORE=$GITHUB_WORKSPACE/mph/release.keystore" >> local.properties
+          echo "MELONDS_KEYSTORE_PASSWORD=hunters123" >> local.properties
+          echo "MELONDS_KEY_ALIAS=melonds" >> local.properties
+          echo "MELONDS_KEY_PASSWORD=hunters123" >> local.properties
+          chmod +x ./gradlew
+          ./gradlew :app:assembleGitHubProdRelease
+          cp app/build/outputs/apk/gitHubProd/release/*.apk $GITHUB_WORKSPACE/melonDS-Hunters.apk
+
+      - name: Upload APK (Actions tab)
+        uses: actions/upload-artifact@v4
+        with:
+          name: melonDS-Hunters
+          path: melonDS-Hunters.apk
+
+      - name: Publish APK (Releases page)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest build
+          body: Newest melonDS Hunters build. Install melonDS-Hunters.apk over the previous one.
+          prerelease: false
+          make_latest: true
+          files: melonDS-Hunters.apk
