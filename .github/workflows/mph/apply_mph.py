@@ -55,7 +55,20 @@ ACT = f"{PKG_DIR}/EmulatorActivity.kt"
 patch(
     ACT,
     "        setContentView(binding.root)\n",
-    "        setContentView(binding.root)\n        binding.mphOverlay.onToggleMenuMode = { swapScreen() }\n",
+    "        setContentView(binding.root)\n"
+    "        binding.mphOverlay.screenAreaApplier = { top, bottom ->\n"
+    "            mainScreenRenderer.updateScreenAreas(top, bottom, 1f, 1f, false, false)\n"
+    "        }\n"
+    "        binding.mphOverlay.onActiveChanged = { isActive ->\n"
+    "            binding.viewLayoutControls.alpha = if (isActive) 0f else 1f\n"
+    "            updateRendererScreenAreas()\n"
+    "        }\n",
+)
+patch(
+    ACT,
+    "    private fun updateRendererScreenAreas() {\n",
+    "    private fun updateRendererScreenAreas() {\n"
+    "        if (binding.mphOverlay.pushScreenAreas()) return\n",
 )
 patch(
     ACT,
