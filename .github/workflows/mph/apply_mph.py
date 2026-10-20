@@ -62,7 +62,9 @@ patch(
     "        binding.mphOverlay.onActiveChanged = { isActive ->\n"
     "            binding.viewLayoutControls.alpha = if (isActive) 0f else 1f\n"
     "            updateRendererScreenAreas()\n"
-    "        }\n",
+    "        }\n"
+    "        binding.mphOverlay.onQuickSave = { viewModel.doQuickSave() }\n"
+    "        binding.mphOverlay.onQuickLoad = { viewModel.doQuickLoad() }\n",
 )
 patch(
     ACT,
