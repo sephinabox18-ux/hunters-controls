@@ -2,6 +2,9 @@ package me.magnum.melonds.ui.emulator.mph
 
 import android.app.AlertDialog
 import android.content.Context
+import android.net.Uri
+import android.widget.Toast
+import java.io.File
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -49,9 +52,14 @@ class MphOverlayView @JvmOverloads constructor(
         // ---- Bottom-screen icon positions (DS pixels, 256x192). Tweak here if a tap misses. ----
         const val BEAM_X = 85;     const val BEAM_Y = 32
         const val MISSILE_X = 125; const val MISSILE_Y = 32
-        const val SPECIAL_X = 165; const val SPECIAL_Y = 32
-        const val MORPH_X = 228;   const val MORPH_Y = 32
-        const val SCAN_X = 128;    const val SCAN_Y = 168
+        const val SPECIAL_X = 232; const val SPECIAL_Y = 34   // opens the affinity-weapon wheel
+        const val MORPH_X = 231;   const val MORPH_Y = 167
+        const val SCAN_X = 128;    const val SCAN_Y = 173
+
+        // Direct-aim mode: the stylus rests here (required for aiming) and never lifts while you aim.
+        const val HOLD_X = 128;    const val HOLD_Y = 96
+        // Game aim units per dp of thumb movement at sensitivity 1.0; Y matches melonPrimeDS's ratio.
+        const val AIM_Y_RATIO = 1.5f
 
         // Safe aiming box on the bottom screen (stays clear of the icons).
         const val AIM_CENTER_X = 128f; const val AIM_CENTER_Y = 104f
@@ -62,9 +70,12 @@ class MphOverlayView @JvmOverloads constructor(
         // Timing (ms). If recentering ever causes an accidental jump, raise RELEASE_GAP_MS.
         const val RELEASE_GAP_MS = 40L
         const val TAP_HOLD_MS = 70L
-        // Morph ball / scan visor want a slower, cleaner "finger" tap.
-        const val SLOW_TAP_GAP_MS = 150L
-        const val SLOW_TAP_HOLD_MS = 150L
+        // Morph ball needs a short tap; turning the scan visor ON needs a ~half-second hold.
+        const val MORPH_HOLD_MS = 50L
+        const val SCAN_ON_HOLD_MS = 520L
+        const val SCAN_OFF_HOLD_MS = 50L
+        // After any scripted tap, wait before re-resting the stylus so it can't read as a double-tap (jump).
+        const val AFTER_TAP_MS = 350L
         // Quick load needs a hold so a stray thumb can't wipe progress.
         const val LOAD_HOLD_MS = 500L
 
@@ -77,8 +88,6 @@ class MphOverlayView @JvmOverloads constructor(
     var screenAreaApplier: ((DsRect?, DsRect?) -> Unit)? = null
     /** Called when Hunters mode switches on/off so the normal layout can be hidden/restored. */
     var onActiveChanged: ((Boolean) -> Unit)? = null
-    var onQuickSave: (() -> Unit)? = null
-    var onQuickLoad: (() -> Unit)? = null
 
     // Screen areas: the big centred screen and the small radar in the top-left.
     private val bigRect = RectF()
@@ -88,11 +97,20 @@ class MphOverlayView @JvmOverloads constructor(
     private var menuMode = false
 
     private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-    private var sensitivity = prefs.getFloat("sens", 0.8f)
+    private var sensitivity = prefs.getFloat("sens2", 1.0f)
     private var invertY = prefs.getBoolean("invertY", false)
     private var opacity = prefs.getInt("opacity", 55)
-    private var vSens = prefs.getFloat("vsens", 1.5f)
-    private var accel = prefs.getFloat("accel", 0.5f)
+    private var vSens = prefs.getFloat("vsens2", 1.0f)
+    private var accel = prefs.getFloat("accel2", 0.25f)
+    private var smoothing = prefs.getFloat("smooth", 0.35f)
+    // State from the native side (bit 1 = direct aim available, 2 = morph ball, 4 = scan visor).
+    private var nativeState = 0
+    private val directAim get() = (nativeState and 1) != 0
+    private val inBall get() = (nativeState and 2) != 0
+    private val inVisor get() = (nativeState and 4) != 0
+    // Smoothed aim velocity (game units per tick)
+    private var smX = 0f
+    private var smY = 0f
 
     private val density = resources.displayMetrics.density
     private fun dp(v: Float) = v * density
@@ -166,6 +184,13 @@ class MphOverlayView @JvmOverloads constructor(
     private var pendingPressY = AIM_CENTER_Y
     // Quick-load hold timer (0 = not holding).
     private var loadHoldStart = 0L
+    // Fractional aim carried between frames so slow, fine movements aren't lost.
+    private var sendCarryX = 0f
+    private var sendCarryY = 0f
+    // Last time you moved/aimed/fired. The resting stylus is only held during play, so it never
+    // presses things in the game's own menus.
+    private var lastPlayInput = 0L
+    private fun touchPlay() { lastPlayInput = SystemClock.uptimeMillis() }
 
     private fun stylusPress(x: Float, y: Float) {
         sx = x; sy = y
@@ -207,12 +232,13 @@ class MphOverlayView @JvmOverloads constructor(
 
     private fun tick() {
         val now = SystemClock.uptimeMillis()
+        nativeState = MelonEmulator.mphGetState()
 
         if (loadHoldStart > 0L) {
             if (now - loadHoldStart >= LOAD_HOLD_MS) {
                 loadHoldStart = 0L
                 releaseAll()
-                onQuickLoad?.invoke()
+                quickState(save = false)
                 return
             }
             invalidate() // animate the hold ring
@@ -244,7 +270,27 @@ class MphOverlayView @JvmOverloads constructor(
             return
         }
 
-        // 3. Aiming.
+        // 3a. Direct aim (USA Hunters): stylus rests at the centre, aim is written straight into the game.
+        if (directAim) {
+            val wantHold = !menuMode && !inBall && (aimWanted() || now - lastPlayInput < 3000L)
+            if (wantHold && !touching && now - lastReleaseAt >= RELEASE_GAP_MS) stylusPress(HOLD_X.toFloat(), HOLD_Y.toFloat())
+            if (!wantHold && touching) stylusRelease()
+
+            // Light smoothing: blend this tick's movement with the last one (0 = raw, 0.8 = very smooth).
+            smX += (accX - smX) * (1f - smoothing)
+            smY += (accY - smY) * (1f - smoothing)
+            val outX = if (aimWanted()) smX else accX
+            val outY = if (aimWanted()) smY else accY
+            accX = 0f; accY = 0f
+            if (!aimWanted()) { smX = 0f; smY = 0f }
+            sendCarryX += outX; sendCarryY += outY
+            val ix = sendCarryX.toInt(); val iy = sendCarryY.toInt()
+            sendCarryX -= ix; sendCarryY -= iy
+            if ((ix != 0 || iy != 0) && touching) MelonEmulator.mphAddAim(ix, iy)
+            return
+        }
+
+        // 3b. Fallback stylus aim (other regions/versions).
         if (aimWanted()) {
             if (!touching) {
                 if (now - lastReleaseAt < RELEASE_GAP_MS) return
@@ -270,16 +316,8 @@ class MphOverlayView @JvmOverloads constructor(
                 accY -= (cy - sy)
                 stylusMove(cx, cy)
                 stylusRelease()
-                pendingPressX = when {
-                    nx > maxX -> AIM_CENTER_X - AIM_RANGE_X * 0.8f
-                    nx < minX -> AIM_CENTER_X + AIM_RANGE_X * 0.8f
-                    else -> AIM_CENTER_X
-                }
-                pendingPressY = when {
-                    ny > maxY -> AIM_CENTER_Y - AIM_RANGE_Y * 0.8f
-                    ny < minY -> AIM_CENTER_Y + AIM_RANGE_Y * 0.8f
-                    else -> AIM_CENTER_Y
-                }
+                pendingPressX = AIM_CENTER_X
+                pendingPressY = AIM_CENTER_Y
             } else {
                 accX -= stepX
                 accY -= stepY
@@ -292,27 +330,28 @@ class MphOverlayView @JvmOverloads constructor(
         }
     }
 
-    private fun queueTap(x: Int, y: Int, slow: Boolean = false) {
+    private fun queueTap(x: Int, y: Int, holdMs: Long = TAP_HOLD_MS) {
         if (touching || queue.isNotEmpty()) {
             queue.addLast(Step.Release)
             queue.addLast(Step.Wait(RELEASE_GAP_MS))
         }
-        if (slow) queue.addLast(Step.Wait(SLOW_TAP_GAP_MS))
         queue.addLast(Step.Press(x.toFloat(), y.toFloat()))
-        queue.addLast(Step.Wait(if (slow) SLOW_TAP_HOLD_MS else TAP_HOLD_MS))
+        queue.addLast(Step.Wait(holdMs))
         queue.addLast(Step.Release)
-        queue.addLast(Step.Wait(RELEASE_GAP_MS))
+        queue.addLast(Step.Wait(if (directAim) AFTER_TAP_MS else RELEASE_GAP_MS))
         accX = 0f; accY = 0f
     }
 
     private fun addAimDelta(dxPx: Float, dyPx: Float, t: Long) {
+        touchPlay()
         // Aim acceleration: quick flicks turn further than slow, precise drags.
         val dt = (t - aimLastT).coerceIn(1L, 100L).toFloat()
         aimLastT = t
         val speed = hypot(dxPx, dyPx) / density / dt // dp per ms
         val gain = 1f + accel * ((speed - 0.25f) * 2f).coerceIn(0f, 2f)
+        val yRatio = if (directAim) AIM_Y_RATIO else 1f
         accX += dxPx / density * sensitivity * gain
-        accY += (if (invertY) -dyPx else dyPx) / density * sensitivity * vSens * gain
+        accY += (if (invertY) -dyPx else dyPx) / density * sensitivity * vSens * yRatio * gain
     }
 
     // ---------------------------------------------------------------- activation
@@ -364,6 +403,7 @@ class MphOverlayView @JvmOverloads constructor(
         fireAiming = false; specialMode = false; directMode = false
         loadHoldStart = 0L
         pendingPressX = AIM_CENTER_X; pendingPressY = AIM_CENTER_Y
+        smX = 0f; smY = 0f; sendCarryX = 0f; sendCarryY = 0f
         queue.clear(); waitUntil = 0L
         accX = 0f; accY = 0f
         buttons.values.forEach { it.pressed = false }
@@ -403,7 +443,7 @@ class MphOverlayView @JvmOverloads constructor(
         bigRect.set((W - gw) / 2f, (H - gh) / 2f, (W + gw) / 2f, (H + gh) / 2f)
 
         // Radar: ~30% of screen height, top-left, kept inside the left black bar when there's room.
-        var rh = H * 0.30f
+        var rh = H * 0.27f
         var rw = rh * 4f / 3f
         if (bigRect.left > dp(60f) && rw > bigRect.left - pad * 2f) { rw = bigRect.left - pad * 2f; rh = rw * 3f / 4f }
         smallRect.set(pad, pad, pad + rw, pad + rh)
@@ -415,14 +455,14 @@ class MphOverlayView @JvmOverloads constructor(
         val rJump = min(dp(32f), m * 0.21f)
         val rSmall = min(dp(24f), m * 0.15f)
         val rWeapon = min(dp(22f), m * 0.14f)
-        val rSys = min(dp(20f), m * 0.12f)
+        val rSys = min(dp(18f), m * 0.11f)
 
         // Left bar: system buttons under the radar.
-        val sysY = smallRect.bottom + rSys + dp(10f)
+        val sysY = smallRect.bottom + rSys + dp(8f)
         place(Kind.MENU, pad + rSys + dp(2f), sysY, rSys)
         place(Kind.START, pad + rSys * 3f + dp(10f), sysY, rSys)
         place(Kind.SETTINGS, pad + rSys * 5f + dp(18f), sysY, rSys)
-        val sysY2 = sysY + rSys * 2f + dp(10f)
+        val sysY2 = sysY + rSys * 2f + dp(6f)
         place(Kind.QSAVE, pad + rSys + dp(2f), sysY2, rSys)
         place(Kind.QLOAD, pad + rSys * 3f + dp(10f), sysY2, rSys)
 
@@ -528,15 +568,16 @@ class MphOverlayView @JvmOverloads constructor(
             b.pressed = true
             when (b.kind) {
                 Kind.FIRE -> {
+                    touchPlay()
                     press(Input.L)
                     fireId = id; fireDownX = x; fireDownY = y; fireAiming = false
                     aimLastX = x; aimLastY = y; aimLastT = t
                 }
-                Kind.JUMP -> press(Input.B)
-                Kind.BOOST -> press(Input.R)
+                Kind.JUMP -> { touchPlay(); press(Input.B) }
+                Kind.BOOST -> { touchPlay(); press(Input.R) }
                 Kind.START -> press(Input.START)
-                Kind.MORPH -> queueTap(MORPH_X, MORPH_Y, slow = true)
-                Kind.SCAN -> queueTap(SCAN_X, SCAN_Y, slow = true)
+                Kind.MORPH -> queueTap(MORPH_X, MORPH_Y, MORPH_HOLD_MS)
+                Kind.SCAN -> queueTap(SCAN_X, SCAN_Y, if (inVisor) SCAN_OFF_HOLD_MS else SCAN_ON_HOLD_MS)
                 Kind.BEAM -> queueTap(BEAM_X, BEAM_Y)
                 Kind.MISSILE -> queueTap(MISSILE_X, MISSILE_Y)
                 Kind.SPECIAL -> {
@@ -570,6 +611,7 @@ class MphOverlayView @JvmOverloads constructor(
 
         if (x < width * 0.42f && stickId == -1) {
             roles[id] = Role.Stick
+            touchPlay()
             stickId = id
             stickOx = x; stickOy = y; stickX = x; stickY = y
             return true
@@ -577,6 +619,7 @@ class MphOverlayView @JvmOverloads constructor(
 
         if (aimId == -1 && !fireAiming) {
             roles[id] = Role.Aim
+            touchPlay()
             aimId = id
             aimLastX = x; aimLastY = y; aimLastT = t
             return true
@@ -588,7 +631,7 @@ class MphOverlayView @JvmOverloads constructor(
 
     private fun pointerMove(id: Int, x: Float, y: Float, t: Long) {
         when (val role = roles[id]) {
-            is Role.Stick -> updateStick(x, y)
+            is Role.Stick -> { touchPlay(); updateStick(x, y) }
             is Role.Direct -> {
                 val (dx, dy) = mapToDs(role.rect, x, y)
                 directX = dx; directY = dy
@@ -608,8 +651,8 @@ class MphOverlayView @JvmOverloads constructor(
                     }
                 }
                 Kind.SPECIAL -> {
-                    accX += (x - specialLastX) / density * 0.6f
-                    accY += (y - specialLastY) / density * 0.6f
+                    accX += (x - specialLastX) / density * 1.2f
+                    accY += (y - specialLastY) / density * 1.2f
                     specialLastX = x; specialLastY = y
                 }
                 else -> {}
@@ -628,7 +671,7 @@ class MphOverlayView @JvmOverloads constructor(
             is Role.Aim -> aimId = -1
             is Role.Direct -> {
                 queue.addLast(Step.Release)
-                queue.addLast(Step.Wait(RELEASE_GAP_MS))
+                queue.addLast(Step.Wait(if (directAim) AFTER_TAP_MS else RELEASE_GAP_MS))
                 directMode = false
             }
             is Role.Button -> {
@@ -641,14 +684,14 @@ class MphOverlayView @JvmOverloads constructor(
                     Kind.SPECIAL -> {
                         specialId = -1
                         queue.addLast(Step.Release)
-                        queue.addLast(Step.Wait(RELEASE_GAP_MS))
+                        queue.addLast(Step.Wait(if (directAim) AFTER_TAP_MS else RELEASE_GAP_MS))
                         // The queued release runs before any aiming resumes.
                         specialMode = false
                     }
                     Kind.MENU -> toggleMenuMode()
                     Kind.BACK -> toggleMenuMode()
                     Kind.SETTINGS -> showSettings()
-                    Kind.QSAVE -> { releaseAll(); onQuickSave?.invoke() }
+                    Kind.QSAVE -> { releaseAll(); quickState(save = true) }
                     Kind.QLOAD -> loadHoldStart = 0L
                     else -> {}
                 }
@@ -658,7 +701,7 @@ class MphOverlayView @JvmOverloads constructor(
     }
 
     private fun updateStick(x: Float, y: Float) {
-        val maxR = dp(60f)
+        val maxR = dp(55f)
         var dx = x - stickOx
         var dy = y - stickOy
         val d = hypot(dx, dy)
@@ -692,6 +735,34 @@ class MphOverlayView @JvmOverloads constructor(
 
     // ---------------------------------------------------------------- settings
 
+    // Own quick-save slot in app storage, so it works no matter where melonDS keeps its save states.
+    private fun quickState(save: Boolean) {
+        val file = File(context.filesDir, "hunters_quick.mln")
+        if (!save && !file.exists()) {
+            Toast.makeText(context, "No quick save yet", Toast.LENGTH_SHORT).show()
+            return
+        }
+        Thread {
+            MelonEmulator.pauseEmulation()
+            val ok = try {
+                val uri = Uri.parse(file.absolutePath)
+                if (save) MelonEmulator.saveState(uri) else MelonEmulator.loadState(uri)
+            } catch (e: Exception) {
+                false
+            }
+            MelonEmulator.resumeEmulation()
+            post {
+                val msg = when {
+                    save && ok -> "Quick saved"
+                    save -> "Quick save failed"
+                    ok -> "Quick loaded"
+                    else -> "Quick load failed"
+                }
+                Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
+            }
+        }.start()
+    }
+
     private fun showSettings() {
         releaseAll()
         val pad = dp(20f).toInt()
@@ -703,8 +774,8 @@ class MphOverlayView @JvmOverloads constructor(
         fun sensText() = "Aim sensitivity: %.1f".format(sensitivity)
         sensLabel.text = sensText()
         val sensBar = SeekBar(context).apply {
-            max = 28 // 0.2 .. 3.0
-            progress = ((sensitivity - 0.2f) * 10f).roundToInt().coerceIn(0, 28)
+            max = 38 // 0.2 .. 4.0
+            progress = ((sensitivity - 0.2f) * 10f).roundToInt().coerceIn(0, 38)
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                 override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
                     sensitivity = 0.2f + p / 10f
@@ -715,7 +786,7 @@ class MphOverlayView @JvmOverloads constructor(
             })
         }
         val vLabel = TextView(context)
-        fun vText() = "Vertical aim boost: %.1fx".format(vSens)
+        fun vText() = "Vertical aim: %.1fx".format(vSens)
         vLabel.text = vText()
         val vBar = SeekBar(context).apply {
             max = 25 // 0.5 .. 3.0
@@ -744,6 +815,21 @@ class MphOverlayView @JvmOverloads constructor(
                 override fun onStopTrackingTouch(s: SeekBar?) {}
             })
         }
+        val smLabel = TextView(context)
+        fun smText() = "Aim smoothing: %d%%".format((smoothing * 100f).roundToInt())
+        smLabel.text = smText()
+        val smBar = SeekBar(context).apply {
+            max = 80
+            progress = (smoothing * 100f).roundToInt().coerceIn(0, 80)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                    smoothing = p / 100f
+                    smLabel.text = smText()
+                }
+                override fun onStartTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) {}
+            })
+        }
         val opLabel = TextView(context).apply { text = "Button opacity" }
         val opBar = SeekBar(context).apply {
             max = 100
@@ -757,9 +843,14 @@ class MphOverlayView @JvmOverloads constructor(
             })
         }
         val invert = CheckBox(context).apply { text = "Invert vertical aim"; isChecked = invertY }
+        val modeLabel = TextView(context).apply {
+            text = if (directAim) "Aim mode: direct (USA version detected)" else "Aim mode: stylus fallback (direct aim needs the USA version)"
+        }
+        root.addView(modeLabel)
         root.addView(sensLabel); root.addView(sensBar)
         root.addView(vLabel); root.addView(vBar)
         root.addView(aLabel); root.addView(aBar)
+        root.addView(smLabel); root.addView(smBar)
         root.addView(opLabel); root.addView(opBar)
         root.addView(invert)
 
@@ -769,11 +860,12 @@ class MphOverlayView @JvmOverloads constructor(
             .setPositiveButton("Done") { _, _ ->
                 invertY = invert.isChecked
                 prefs.edit()
-                    .putFloat("sens", sensitivity)
+                    .putFloat("sens2", sensitivity)
                     .putBoolean("invertY", invertY)
                     .putInt("opacity", opacity)
-                    .putFloat("vsens", vSens)
-                    .putFloat("accel", accel)
+                    .putFloat("vsens2", vSens)
+                    .putFloat("accel2", accel)
+                    .putFloat("smooth", smoothing)
                     .apply()
                 invalidate()
             }
@@ -886,7 +978,7 @@ class MphOverlayView @JvmOverloads constructor(
     }
 
     private fun drawStick(canvas: Canvas, cx: Float, cy: Float, knobX: Float, knobY: Float, live: Boolean) {
-        val r = dp(60f)
+        val r = dp(55f)
         stroke.strokeWidth = dp(1.5f); stroke.color = col(hudGreen, alpha(if (live) 200 else 70))
         canvas.drawCircle(cx, cy, r, stroke)
         // eight ticks around the ring
@@ -930,7 +1022,7 @@ class MphOverlayView @JvmOverloads constructor(
         if (stickId != -1) {
             drawStick(canvas, stickOx, stickOy, stickX, stickY, true)
         } else {
-            drawStick(canvas, max(dp(75f), bigRect.left * 0.5f), height * 0.72f, 0f, 0f, false)
+            drawStick(canvas, max(dp(75f), bigRect.left * 0.5f), height * 0.78f, 0f, 0f, false)
         }
 
         for (k in visibleKinds()) {
