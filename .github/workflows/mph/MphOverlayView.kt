@@ -118,7 +118,7 @@ class MphOverlayView @JvmOverloads constructor(
     private enum class Kind(val label: String) {
         FIRE("FIRE"), JUMP("JUMP"), BOOST("BOOST"), MORPH("BALL"), SCAN("SCAN"),
         BEAM("BEAM"), MISSILE("MSL"), SPECIAL("WPN"), START("START"), MENU("MENU"), SETTINGS("⚙"), BACK("BACK"),
-        QSAVE("SAVE"), QLOAD("LOAD")
+        QSAVE("SAVE"), QLOAD("LOAD"), FILE("FILE")
     }
 
     private class Btn(val kind: Kind, var cx: Float = 0f, var cy: Float = 0f, var r: Float = 0f, var pressed: Boolean = false)
@@ -191,6 +191,10 @@ class MphOverlayView @JvmOverloads constructor(
     // presses things in the game's own menus.
     private var lastPlayInput = 0L
     private fun touchPlay() { lastPlayInput = SystemClock.uptimeMillis() }
+    // FILE popup (SAVE / LOAD) open?
+    private var filePopup = false
+    // Idle stick ring position
+    private var stickHintY = 0f
 
     private fun stylusPress(x: Float, y: Float) {
         sx = x; sy = y
@@ -442,10 +446,16 @@ class MphOverlayView @JvmOverloads constructor(
         if (gw > W) { gw = W; gh = W * 3f / 4f }
         bigRect.set((W - gw) / 2f, (H - gh) / 2f, (W + gw) / 2f, (H + gh) / 2f)
 
-        // Radar: ~30% of screen height, top-left, kept inside the left black bar when there's room.
-        var rh = H * 0.27f
-        var rw = rh * 4f / 3f
-        if (bigRect.left > dp(60f) && rw > bigRect.left - pad * 2f) { rw = bigRect.left - pad * 2f; rh = rw * 3f / 4f }
+        // Radar: as big as the left black bar allows (4:3, not stretched), capped at 42% of the height.
+        var rw: Float
+        var rh: Float
+        if (bigRect.left > dp(60f)) {
+            rw = bigRect.left - pad * 2f
+            rh = rw * 3f / 4f
+            if (rh > H * 0.42f) { rh = H * 0.42f; rw = rh * 4f / 3f }
+        } else {
+            rh = H * 0.27f; rw = rh * 4f / 3f
+        }
         smallRect.set(pad, pad, pad + rw, pad + rh)
 
         // Side bar width used to size/place buttons (falls back to 120dp on narrow screens).
@@ -455,16 +465,20 @@ class MphOverlayView @JvmOverloads constructor(
         val rJump = min(dp(32f), m * 0.21f)
         val rSmall = min(dp(24f), m * 0.15f)
         val rWeapon = min(dp(22f), m * 0.14f)
-        val rSys = min(dp(18f), m * 0.11f)
-
-        // Left bar: system buttons under the radar.
+        // Left bar: one row of four under the radar (MENU, START, settings, FILE).
+        val rowW = smallRect.width()
+        val slot = rowW / 4f
+        val rSys = min(dp(18f), slot * 0.42f)
         val sysY = smallRect.bottom + rSys + dp(8f)
-        place(Kind.MENU, pad + rSys + dp(2f), sysY, rSys)
-        place(Kind.START, pad + rSys * 3f + dp(10f), sysY, rSys)
-        place(Kind.SETTINGS, pad + rSys * 5f + dp(18f), sysY, rSys)
-        val sysY2 = sysY + rSys * 2f + dp(6f)
-        place(Kind.QSAVE, pad + rSys + dp(2f), sysY2, rSys)
-        place(Kind.QLOAD, pad + rSys * 3f + dp(10f), sysY2, rSys)
+        place(Kind.MENU, pad + slot * 0.5f, sysY, rSys)
+        place(Kind.START, pad + slot * 1.5f, sysY, rSys)
+        place(Kind.SETTINGS, pad + slot * 2.5f, sysY, rSys)
+        place(Kind.FILE, pad + slot * 3.5f, sysY, rSys)
+        // FILE popup: SAVE and LOAD drop down under the right half of the row.
+        val popY = sysY + rSys * 2f + dp(8f)
+        place(Kind.QSAVE, pad + slot * 2.5f, popY, rSys)
+        place(Kind.QLOAD, pad + slot * 3.5f, popY, rSys)
+        stickHintY = max(H * 0.78f, sysY + rSys + dp(70f)).coerceAtMost(H - dp(58f))
 
         // Right bar: weapons along the top, action cluster below.
         val rightEdge = W - m
@@ -493,7 +507,9 @@ class MphOverlayView @JvmOverloads constructor(
 
     private fun visibleKinds(): List<Kind> =
         if (menuMode) listOf(Kind.BACK)
-        else Kind.values().filter { it != Kind.BACK }
+        else Kind.values().filter {
+            it != Kind.BACK && (filePopup || (it != Kind.QSAVE && it != Kind.QLOAD))
+        }
 
     private fun hit(x: Float, y: Float): Btn? {
         for (k in visibleKinds()) {
@@ -563,6 +579,11 @@ class MphOverlayView @JvmOverloads constructor(
             return true
         }
 
+        if (filePopup && b?.kind != Kind.QSAVE && b?.kind != Kind.QLOAD && b?.kind != Kind.FILE) {
+            filePopup = false
+            invalidate()
+        }
+
         if (b != null) {
             roles[id] = Role.Button(b.kind)
             b.pressed = true
@@ -595,7 +616,8 @@ class MphOverlayView @JvmOverloads constructor(
                 Kind.SETTINGS -> {}
                 Kind.BACK -> {}
                 Kind.QSAVE -> {}
-                Kind.QLOAD -> loadHoldStart = SystemClock.uptimeMillis()
+                Kind.QLOAD -> {}
+                Kind.FILE -> {}
             }
             return true
         }
@@ -691,8 +713,9 @@ class MphOverlayView @JvmOverloads constructor(
                     Kind.MENU -> toggleMenuMode()
                     Kind.BACK -> toggleMenuMode()
                     Kind.SETTINGS -> showSettings()
-                    Kind.QSAVE -> { releaseAll(); quickState(save = true) }
-                    Kind.QLOAD -> loadHoldStart = 0L
+                    Kind.QSAVE -> { filePopup = false; releaseAll(); quickState(save = true) }
+                    Kind.QLOAD -> { filePopup = false; releaseAll(); quickState(save = false) }
+                    Kind.FILE -> filePopup = !filePopup
                     else -> {}
                 }
             }
@@ -729,6 +752,7 @@ class MphOverlayView @JvmOverloads constructor(
     private fun toggleMenuMode() {
         releaseAll()
         menuMode = !menuMode
+        filePopup = false
         pushScreenAreas()
         invalidate()
     }
@@ -941,7 +965,7 @@ class MphOverlayView @JvmOverloads constructor(
         stroke.strokeWidth = dp(1f); stroke.color = col(c, alpha(80))
         canvas.drawPath(octagon(b.cx, b.cy, b.r * 0.80f), stroke)
 
-        val size = if (b.kind == Kind.SETTINGS) b.r * 0.9f else min(dp(12f), b.r * 0.42f)
+        val size = if (b.kind == Kind.SETTINGS) b.r * 0.9f else min(dp(12f), b.r * 0.47f)
         drawLabel(canvas, b.kind.label, b.cx, b.cy, size, c, alpha(if (b.pressed) 255 else 220))
 
         if (b.kind == Kind.QLOAD && loadHoldStart > 0L) {
@@ -1022,7 +1046,7 @@ class MphOverlayView @JvmOverloads constructor(
         if (stickId != -1) {
             drawStick(canvas, stickOx, stickOy, stickX, stickY, true)
         } else {
-            drawStick(canvas, max(dp(75f), bigRect.left * 0.5f), height * 0.78f, 0f, 0f, false)
+            drawStick(canvas, max(dp(75f), bigRect.left * 0.5f), stickHintY, 0f, 0f, false)
         }
 
         for (k in visibleKinds()) {
