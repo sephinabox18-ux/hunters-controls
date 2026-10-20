@@ -5,6 +5,8 @@ import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.Typeface
 import android.graphics.RectF
 import android.os.Build
 import android.os.SystemClock
@@ -53,11 +55,18 @@ class MphOverlayView @JvmOverloads constructor(
 
         // Safe aiming box on the bottom screen (stays clear of the icons).
         const val AIM_CENTER_X = 128f; const val AIM_CENTER_Y = 104f
-        const val AIM_RANGE_X = 76f;   const val AIM_RANGE_Y = 40f
+        const val AIM_RANGE_X = 76f;   const val AIM_RANGE_Y = 44f
+        // Largest stylus step per frame (DS px). Big jumps get spread over frames so the game doesn't drop them.
+        const val MAX_STEP = 12f
 
         // Timing (ms). If recentering ever causes an accidental jump, raise RELEASE_GAP_MS.
         const val RELEASE_GAP_MS = 40L
         const val TAP_HOLD_MS = 70L
+        // Morph ball / scan visor want a slower, cleaner "finger" tap.
+        const val SLOW_TAP_GAP_MS = 150L
+        const val SLOW_TAP_HOLD_MS = 150L
+        // Quick load needs a hold so a stray thumb can't wipe progress.
+        const val LOAD_HOLD_MS = 500L
 
         private const val PREFS = "mph_controls"
     }
@@ -68,6 +77,8 @@ class MphOverlayView @JvmOverloads constructor(
     var screenAreaApplier: ((DsRect?, DsRect?) -> Unit)? = null
     /** Called when Hunters mode switches on/off so the normal layout can be hidden/restored. */
     var onActiveChanged: ((Boolean) -> Unit)? = null
+    var onQuickSave: (() -> Unit)? = null
+    var onQuickLoad: (() -> Unit)? = null
 
     // Screen areas: the big centred screen and the small radar in the top-left.
     private val bigRect = RectF()
@@ -80,13 +91,16 @@ class MphOverlayView @JvmOverloads constructor(
     private var sensitivity = prefs.getFloat("sens", 0.8f)
     private var invertY = prefs.getBoolean("invertY", false)
     private var opacity = prefs.getInt("opacity", 55)
+    private var vSens = prefs.getFloat("vsens", 1.5f)
+    private var accel = prefs.getFloat("accel", 0.5f)
 
     private val density = resources.displayMetrics.density
     private fun dp(v: Float) = v * density
 
     private enum class Kind(val label: String) {
         FIRE("FIRE"), JUMP("JUMP"), BOOST("BOOST"), MORPH("BALL"), SCAN("SCAN"),
-        BEAM("BEAM"), MISSILE("MSL"), SPECIAL("WPN"), START("START"), MENU("MENU"), SETTINGS("⚙"), BACK("BACK")
+        BEAM("BEAM"), MISSILE("MSL"), SPECIAL("WPN"), START("START"), MENU("MENU"), SETTINGS("⚙"), BACK("BACK"),
+        QSAVE("SAVE"), QLOAD("LOAD")
     }
 
     private class Btn(val kind: Kind, var cx: Float = 0f, var cy: Float = 0f, var r: Float = 0f, var pressed: Boolean = false)
@@ -112,6 +126,7 @@ class MphOverlayView @JvmOverloads constructor(
     // Aim (plain right-thumb aim, or a FIRE press that started sliding)
     private var aimId = -1
     private var aimLastX = 0f; private var aimLastY = 0f
+    private var aimLastT = 0L
     private var fireId = -1
     private var fireDownX = 0f; private var fireDownY = 0f
     private var fireAiming = false
@@ -146,6 +161,11 @@ class MphOverlayView @JvmOverloads constructor(
     private var accX = 0f
     private var accY = 0f
     private var specialMode = false
+    // Where the stylus re-presses after a recentre (far side of the box, so the next stroke has room).
+    private var pendingPressX = AIM_CENTER_X
+    private var pendingPressY = AIM_CENTER_Y
+    // Quick-load hold timer (0 = not holding).
+    private var loadHoldStart = 0L
 
     private fun stylusPress(x: Float, y: Float) {
         sx = x; sy = y
@@ -188,6 +208,16 @@ class MphOverlayView @JvmOverloads constructor(
     private fun tick() {
         val now = SystemClock.uptimeMillis()
 
+        if (loadHoldStart > 0L) {
+            if (now - loadHoldStart >= LOAD_HOLD_MS) {
+                loadHoldStart = 0L
+                releaseAll()
+                onQuickLoad?.invoke()
+                return
+            }
+            invalidate() // animate the hold ring
+        }
+
         // 1. Scripted steps (icon taps, gaps) take priority.
         while (queue.isNotEmpty()) {
             if (now < waitUntil) return
@@ -218,47 +248,71 @@ class MphOverlayView @JvmOverloads constructor(
         if (aimWanted()) {
             if (!touching) {
                 if (now - lastReleaseAt < RELEASE_GAP_MS) return
-                // Fresh press at the centre; movement is applied from the next frame so the
-                // game takes this point as its reference instead of snapping the camera.
-                stylusPress(AIM_CENTER_X, AIM_CENTER_Y)
+                // Fresh press; movement is applied from the next frame so the game takes this
+                // point as its reference instead of snapping the camera.
+                stylusPress(pendingPressX, pendingPressY)
+                pendingPressX = AIM_CENTER_X; pendingPressY = AIM_CENTER_Y
                 return
             }
             if (accX == 0f && accY == 0f) return
-            val nx = sx + accX
-            val ny = sy + accY
-            if (abs(nx - AIM_CENTER_X) > AIM_RANGE_X || abs(ny - AIM_CENTER_Y) > AIM_RANGE_Y) {
-                // Hit the edge of the safe box: move as far as we can, then lift and recentre.
-                val cx = nx.coerceIn(AIM_CENTER_X - AIM_RANGE_X, AIM_CENTER_X + AIM_RANGE_X)
-                val cy = ny.coerceIn(AIM_CENTER_Y - AIM_RANGE_Y, AIM_CENTER_Y + AIM_RANGE_Y)
-                accX = nx - cx
-                accY = ny - cy
+            val stepX = accX.coerceIn(-MAX_STEP, MAX_STEP)
+            val stepY = accY.coerceIn(-MAX_STEP, MAX_STEP)
+            val nx = sx + stepX
+            val ny = sy + stepY
+            val minX = AIM_CENTER_X - AIM_RANGE_X; val maxX = AIM_CENTER_X + AIM_RANGE_X
+            val minY = AIM_CENTER_Y - AIM_RANGE_Y; val maxY = AIM_CENTER_Y + AIM_RANGE_Y
+            if (nx < minX || nx > maxX || ny < minY || ny > maxY) {
+                // Hit the edge of the safe box: move as far as we can, lift, and re-press on the
+                // opposite side so the next stroke can travel the whole box.
+                val cx = nx.coerceIn(minX, maxX)
+                val cy = ny.coerceIn(minY, maxY)
+                accX -= (cx - sx)
+                accY -= (cy - sy)
                 stylusMove(cx, cy)
                 stylusRelease()
+                pendingPressX = when {
+                    nx > maxX -> AIM_CENTER_X - AIM_RANGE_X * 0.8f
+                    nx < minX -> AIM_CENTER_X + AIM_RANGE_X * 0.8f
+                    else -> AIM_CENTER_X
+                }
+                pendingPressY = when {
+                    ny > maxY -> AIM_CENTER_Y - AIM_RANGE_Y * 0.8f
+                    ny < minY -> AIM_CENTER_Y + AIM_RANGE_Y * 0.8f
+                    else -> AIM_CENTER_Y
+                }
             } else {
-                accX = 0f; accY = 0f
+                accX -= stepX
+                accY -= stepY
                 stylusMove(nx, ny)
             }
         } else {
             accX = 0f; accY = 0f
+            pendingPressX = AIM_CENTER_X; pendingPressY = AIM_CENTER_Y
             if (touching) stylusRelease()
         }
     }
 
-    private fun queueTap(x: Int, y: Int) {
+    private fun queueTap(x: Int, y: Int, slow: Boolean = false) {
         if (touching || queue.isNotEmpty()) {
             queue.addLast(Step.Release)
             queue.addLast(Step.Wait(RELEASE_GAP_MS))
         }
+        if (slow) queue.addLast(Step.Wait(SLOW_TAP_GAP_MS))
         queue.addLast(Step.Press(x.toFloat(), y.toFloat()))
-        queue.addLast(Step.Wait(TAP_HOLD_MS))
+        queue.addLast(Step.Wait(if (slow) SLOW_TAP_HOLD_MS else TAP_HOLD_MS))
         queue.addLast(Step.Release)
         queue.addLast(Step.Wait(RELEASE_GAP_MS))
         accX = 0f; accY = 0f
     }
 
-    private fun addAimDelta(dxPx: Float, dyPx: Float) {
-        accX += dxPx / density * sensitivity
-        accY += (if (invertY) -dyPx else dyPx) / density * sensitivity
+    private fun addAimDelta(dxPx: Float, dyPx: Float, t: Long) {
+        // Aim acceleration: quick flicks turn further than slow, precise drags.
+        val dt = (t - aimLastT).coerceIn(1L, 100L).toFloat()
+        aimLastT = t
+        val speed = hypot(dxPx, dyPx) / density / dt // dp per ms
+        val gain = 1f + accel * ((speed - 0.25f) * 2f).coerceIn(0f, 2f)
+        accX += dxPx / density * sensitivity * gain
+        accY += (if (invertY) -dyPx else dyPx) / density * sensitivity * vSens * gain
     }
 
     // ---------------------------------------------------------------- activation
@@ -308,6 +362,8 @@ class MphOverlayView @JvmOverloads constructor(
         roles.clear()
         stickId = -1; aimId = -1; fireId = -1; specialId = -1
         fireAiming = false; specialMode = false; directMode = false
+        loadHoldStart = 0L
+        pendingPressX = AIM_CENTER_X; pendingPressY = AIM_CENTER_Y
         queue.clear(); waitUntil = 0L
         accX = 0f; accY = 0f
         buttons.values.forEach { it.pressed = false }
@@ -366,6 +422,9 @@ class MphOverlayView @JvmOverloads constructor(
         place(Kind.MENU, pad + rSys + dp(2f), sysY, rSys)
         place(Kind.START, pad + rSys * 3f + dp(10f), sysY, rSys)
         place(Kind.SETTINGS, pad + rSys * 5f + dp(18f), sysY, rSys)
+        val sysY2 = sysY + rSys * 2f + dp(10f)
+        place(Kind.QSAVE, pad + rSys + dp(2f), sysY2, rSys)
+        place(Kind.QLOAD, pad + rSys * 3f + dp(10f), sysY2, rSys)
 
         // Right bar: weapons along the top, action cluster below.
         val rightEdge = W - m
@@ -431,11 +490,11 @@ class MphOverlayView @JvmOverloads constructor(
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
                 val i = event.actionIndex
-                pointerDown(event.getPointerId(i), event.getX(i), event.getY(i))
+                pointerDown(event.getPointerId(i), event.getX(i), event.getY(i), event.eventTime)
             }
             MotionEvent.ACTION_MOVE -> {
                 for (i in 0 until event.pointerCount) {
-                    pointerMove(event.getPointerId(i), event.getX(i), event.getY(i))
+                    pointerMove(event.getPointerId(i), event.getX(i), event.getY(i), event.eventTime)
                 }
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
@@ -448,7 +507,7 @@ class MphOverlayView @JvmOverloads constructor(
         return true
     }
 
-    private fun pointerDown(id: Int, x: Float, y: Float): Boolean {
+    private fun pointerDown(id: Int, x: Float, y: Float, t: Long): Boolean {
         val b = hit(x, y)
         if (menuMode) {
             if (b?.kind == Kind.BACK) {
@@ -471,13 +530,13 @@ class MphOverlayView @JvmOverloads constructor(
                 Kind.FIRE -> {
                     press(Input.L)
                     fireId = id; fireDownX = x; fireDownY = y; fireAiming = false
-                    aimLastX = x; aimLastY = y
+                    aimLastX = x; aimLastY = y; aimLastT = t
                 }
                 Kind.JUMP -> press(Input.B)
                 Kind.BOOST -> press(Input.R)
                 Kind.START -> press(Input.START)
-                Kind.MORPH -> queueTap(MORPH_X, MORPH_Y)
-                Kind.SCAN -> queueTap(SCAN_X, SCAN_Y)
+                Kind.MORPH -> queueTap(MORPH_X, MORPH_Y, slow = true)
+                Kind.SCAN -> queueTap(SCAN_X, SCAN_Y, slow = true)
                 Kind.BEAM -> queueTap(BEAM_X, BEAM_Y)
                 Kind.MISSILE -> queueTap(MISSILE_X, MISSILE_Y)
                 Kind.SPECIAL -> {
@@ -494,6 +553,8 @@ class MphOverlayView @JvmOverloads constructor(
                 Kind.MENU -> {}
                 Kind.SETTINGS -> {}
                 Kind.BACK -> {}
+                Kind.QSAVE -> {}
+                Kind.QLOAD -> loadHoldStart = SystemClock.uptimeMillis()
             }
             return true
         }
@@ -517,7 +578,7 @@ class MphOverlayView @JvmOverloads constructor(
         if (aimId == -1 && !fireAiming) {
             roles[id] = Role.Aim
             aimId = id
-            aimLastX = x; aimLastY = y
+            aimLastX = x; aimLastY = y; aimLastT = t
             return true
         }
 
@@ -525,7 +586,7 @@ class MphOverlayView @JvmOverloads constructor(
         return true
     }
 
-    private fun pointerMove(id: Int, x: Float, y: Float) {
+    private fun pointerMove(id: Int, x: Float, y: Float, t: Long) {
         when (val role = roles[id]) {
             is Role.Stick -> updateStick(x, y)
             is Role.Direct -> {
@@ -533,16 +594,16 @@ class MphOverlayView @JvmOverloads constructor(
                 directX = dx; directY = dy
             }
             is Role.Aim -> {
-                addAimDelta(x - aimLastX, y - aimLastY)
+                addAimDelta(x - aimLastX, y - aimLastY, t)
                 aimLastX = x; aimLastY = y
             }
             is Role.Button -> when (role.kind) {
                 Kind.FIRE -> {
                     if (!fireAiming && aimId == -1 && hypot(x - fireDownX, y - fireDownY) > dp(10f)) {
                         fireAiming = true
-                        aimLastX = x; aimLastY = y
+                        aimLastX = x; aimLastY = y; aimLastT = t
                     } else if (fireAiming) {
-                        addAimDelta(x - aimLastX, y - aimLastY)
+                        addAimDelta(x - aimLastX, y - aimLastY, t)
                         aimLastX = x; aimLastY = y
                     }
                 }
@@ -587,6 +648,8 @@ class MphOverlayView @JvmOverloads constructor(
                     Kind.MENU -> toggleMenuMode()
                     Kind.BACK -> toggleMenuMode()
                     Kind.SETTINGS -> showSettings()
+                    Kind.QSAVE -> { releaseAll(); onQuickSave?.invoke() }
+                    Kind.QLOAD -> loadHoldStart = 0L
                     else -> {}
                 }
             }
@@ -651,6 +714,36 @@ class MphOverlayView @JvmOverloads constructor(
                 override fun onStopTrackingTouch(s: SeekBar?) {}
             })
         }
+        val vLabel = TextView(context)
+        fun vText() = "Vertical aim boost: %.1fx".format(vSens)
+        vLabel.text = vText()
+        val vBar = SeekBar(context).apply {
+            max = 25 // 0.5 .. 3.0
+            progress = ((vSens - 0.5f) * 10f).roundToInt().coerceIn(0, 25)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                    vSens = 0.5f + p / 10f
+                    vLabel.text = vText()
+                }
+                override fun onStartTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) {}
+            })
+        }
+        val aLabel = TextView(context)
+        fun aText() = "Flick acceleration: %d%%".format((accel * 100f).roundToInt())
+        aLabel.text = aText()
+        val aBar = SeekBar(context).apply {
+            max = 100
+            progress = (accel * 100f).roundToInt().coerceIn(0, 100)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                    accel = p / 100f
+                    aLabel.text = aText()
+                }
+                override fun onStartTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) {}
+            })
+        }
         val opLabel = TextView(context).apply { text = "Button opacity" }
         val opBar = SeekBar(context).apply {
             max = 100
@@ -665,6 +758,8 @@ class MphOverlayView @JvmOverloads constructor(
         }
         val invert = CheckBox(context).apply { text = "Invert vertical aim"; isChecked = invertY }
         root.addView(sensLabel); root.addView(sensBar)
+        root.addView(vLabel); root.addView(vBar)
+        root.addView(aLabel); root.addView(aBar)
         root.addView(opLabel); root.addView(opBar)
         root.addView(invert)
 
@@ -677,67 +772,170 @@ class MphOverlayView @JvmOverloads constructor(
                     .putFloat("sens", sensitivity)
                     .putBoolean("invertY", invertY)
                     .putInt("opacity", opacity)
+                    .putFloat("vsens", vSens)
+                    .putFloat("accel", accel)
                     .apply()
                 invalidate()
             }
             .show()
     }
 
-    // ---------------------------------------------------------------- drawing
+    // ---------------------------------------------------------------- drawing (visor style)
 
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
-    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = dp(2f) }
-    private val text = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.WHITE; textAlign = Paint.Align.CENTER; isFakeBoldText = true
+    private val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; strokeJoin = Paint.Join.MITER
     }
+    private val text = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        textAlign = Paint.Align.CENTER
+        typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+        letterSpacing = 0.08f
+    }
+    private val path = Path()
+    private val arcRect = RectF()
 
     private fun alpha(base: Int) = (base * opacity / 100f).roundToInt().coerceIn(0, 255)
+
+    // HUD colours (r, g, b)
+    private val hudGreen = intArrayOf(120, 255, 150)
+    private val hudAmber = intArrayOf(255, 150, 60)
+    private val hudCyan = intArrayOf(90, 215, 255)
+    private val hudYellow = intArrayOf(255, 215, 80)
+
+    private fun col(c: IntArray, a: Int) = Color.argb(a.coerceIn(0, 255), c[0], c[1], c[2])
+
+    private fun octagon(cx: Float, cy: Float, r: Float): Path {
+        val c = r * 0.42f
+        path.reset()
+        path.moveTo(cx - r + c, cy - r)
+        path.lineTo(cx + r - c, cy - r)
+        path.lineTo(cx + r, cy - r + c)
+        path.lineTo(cx + r, cy + r - c)
+        path.lineTo(cx + r - c, cy + r)
+        path.lineTo(cx - r + c, cy + r)
+        path.lineTo(cx - r, cy + r - c)
+        path.lineTo(cx - r, cy - r + c)
+        path.close()
+        return path
+    }
+
+    private fun colourFor(k: Kind) = when (k) {
+        Kind.FIRE -> hudAmber
+        Kind.JUMP -> hudCyan
+        Kind.MORPH, Kind.BOOST -> hudYellow
+        else -> hudGreen
+    }
+
+    private fun drawLabel(canvas: Canvas, label: String, cx: Float, cy: Float, size: Float, c: IntArray, a: Int) {
+        text.textSize = size
+        text.color = col(c, a)
+        canvas.drawText(label, cx, cy + size * 0.36f, text)
+    }
+
+    private fun drawOctButton(canvas: Canvas, b: Btn) {
+        val c = colourFor(b.kind)
+        val p = octagon(b.cx, b.cy, b.r)
+        fill.color = Color.argb(alpha(if (b.pressed) 190 else 130), 4, 16, 12)
+        canvas.drawPath(p, fill)
+        if (b.pressed) {
+            fill.color = col(c, alpha(80))
+            canvas.drawPath(p, fill)
+        }
+        // soft outer glow, crisp edge, faint inner frame
+        stroke.strokeWidth = dp(6f); stroke.color = col(c, alpha(if (b.pressed) 110 else 35))
+        canvas.drawPath(p, stroke)
+        stroke.strokeWidth = dp(1.8f); stroke.color = col(c, alpha(235))
+        canvas.drawPath(p, stroke)
+        stroke.strokeWidth = dp(1f); stroke.color = col(c, alpha(80))
+        canvas.drawPath(octagon(b.cx, b.cy, b.r * 0.80f), stroke)
+
+        val size = if (b.kind == Kind.SETTINGS) b.r * 0.9f else min(dp(12f), b.r * 0.42f)
+        drawLabel(canvas, b.kind.label, b.cx, b.cy, size, c, alpha(if (b.pressed) 255 else 220))
+
+        if (b.kind == Kind.QLOAD && loadHoldStart > 0L) {
+            val f = ((SystemClock.uptimeMillis() - loadHoldStart).toFloat() / LOAD_HOLD_MS).coerceIn(0f, 1f)
+            val rr = b.r + dp(5f)
+            arcRect.set(b.cx - rr, b.cy - rr, b.cx + rr, b.cy + rr)
+            stroke.strokeWidth = dp(3f); stroke.color = col(c, 255)
+            canvas.drawArc(arcRect, -90f, 360f * f, false, stroke)
+        }
+    }
+
+    private fun drawFire(canvas: Canvas, b: Btn) {
+        val c = colourFor(b.kind)
+        fill.color = Color.argb(alpha(if (b.pressed) 190 else 120), 16, 8, 4)
+        canvas.drawCircle(b.cx, b.cy, b.r, fill)
+        if (b.pressed) {
+            fill.color = col(c, alpha(70))
+            canvas.drawCircle(b.cx, b.cy, b.r, fill)
+        }
+        stroke.strokeWidth = dp(7f); stroke.color = col(c, alpha(if (b.pressed) 110 else 35))
+        canvas.drawCircle(b.cx, b.cy, b.r, stroke)
+        stroke.strokeWidth = dp(2f); stroke.color = col(c, alpha(235))
+        canvas.drawCircle(b.cx, b.cy, b.r, stroke)
+        // reticle: inner ring + four ticks
+        stroke.strokeWidth = dp(1.4f); stroke.color = col(c, alpha(170))
+        canvas.drawCircle(b.cx, b.cy, b.r * 0.42f, stroke)
+        stroke.strokeWidth = dp(2.2f); stroke.color = col(c, alpha(220))
+        val a = b.r * 0.58f; val z = b.r * 0.86f
+        canvas.drawLine(b.cx, b.cy - z, b.cx, b.cy - a, stroke)
+        canvas.drawLine(b.cx, b.cy + a, b.cx, b.cy + z, stroke)
+        canvas.drawLine(b.cx - z, b.cy, b.cx - a, b.cy, stroke)
+        canvas.drawLine(b.cx + a, b.cy, b.cx + z, b.cy, stroke)
+        drawLabel(canvas, "FIRE", b.cx, b.cy, b.r * 0.22f, c, alpha(if (b.pressed) 255 else 220))
+    }
+
+    private fun drawStick(canvas: Canvas, cx: Float, cy: Float, knobX: Float, knobY: Float, live: Boolean) {
+        val r = dp(60f)
+        stroke.strokeWidth = dp(1.5f); stroke.color = col(hudGreen, alpha(if (live) 200 else 70))
+        canvas.drawCircle(cx, cy, r, stroke)
+        // eight ticks around the ring
+        stroke.strokeWidth = dp(2f)
+        for (i in 0 until 8) {
+            val ang = Math.toRadians(i * 45.0)
+            val ca = Math.cos(ang).toFloat(); val sa = Math.sin(ang).toFloat()
+            canvas.drawLine(cx + ca * r * 0.86f, cy + sa * r * 0.86f, cx + ca * r, cy + sa * r, stroke)
+        }
+        if (live) {
+            val p = octagon(knobX, knobY, dp(24f))
+            fill.color = Color.argb(alpha(150), 4, 16, 12)
+            canvas.drawPath(p, fill)
+            stroke.strokeWidth = dp(6f); stroke.color = col(hudGreen, alpha(60))
+            canvas.drawPath(p, stroke)
+            stroke.strokeWidth = dp(1.8f); stroke.color = col(hudGreen, alpha(235))
+            canvas.drawPath(p, stroke)
+        }
+    }
+
+    private fun drawBrackets(canvas: Canvas, r: RectF) {
+        val l = dp(14f)
+        stroke.strokeWidth = dp(2f); stroke.color = col(hudGreen, alpha(200))
+        canvas.drawLine(r.left, r.top, r.left + l, r.top, stroke); canvas.drawLine(r.left, r.top, r.left, r.top + l, stroke)
+        canvas.drawLine(r.right, r.top, r.right - l, r.top, stroke); canvas.drawLine(r.right, r.top, r.right, r.top + l, stroke)
+        canvas.drawLine(r.left, r.bottom, r.left + l, r.bottom, stroke); canvas.drawLine(r.left, r.bottom, r.left, r.bottom - l, stroke)
+        canvas.drawLine(r.right, r.bottom, r.right - l, r.bottom, stroke); canvas.drawLine(r.right, r.bottom, r.right, r.bottom - l, stroke)
+    }
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         if (!active) return
 
         if (menuMode) {
-            val b = buttons.getValue(Kind.BACK)
-            fill.color = Color.argb(if (b.pressed) 230 else 170, 20, 120, 160)
-            canvas.drawCircle(b.cx, b.cy, b.r, fill)
-            text.textSize = min(dp(14f), b.r * 0.5f)
-            text.alpha = 255
-            canvas.drawText(b.kind.label, b.cx, b.cy + text.textSize * 0.35f, text)
+            drawOctButton(canvas, buttons.getValue(Kind.BACK))
             return
         }
 
-        // Floating stick
-        if (stickId != -1) {
-            fill.color = Color.argb(alpha(90), 255, 255, 255)
-            stroke.color = Color.argb(alpha(200), 255, 255, 255)
-            canvas.drawCircle(stickOx, stickOy, dp(60f), stroke)
-            canvas.drawCircle(stickX, stickY, dp(26f), fill)
-        } else {
-            stroke.color = Color.argb(alpha(70), 255, 255, 255)
-            canvas.drawCircle(max(dp(75f), bigRect.left * 0.5f), height * 0.72f, dp(60f), stroke)
-        }
+        drawBrackets(canvas, smallRect)
 
-        // Thin outline so the radar reads as tappable.
-        stroke.color = Color.argb(alpha(120), 255, 255, 255)
-        canvas.drawRect(smallRect, stroke)
+        if (stickId != -1) {
+            drawStick(canvas, stickOx, stickOy, stickX, stickY, true)
+        } else {
+            drawStick(canvas, max(dp(75f), bigRect.left * 0.5f), height * 0.72f, 0f, 0f, false)
+        }
 
         for (k in visibleKinds()) {
             val b = buttons.getValue(k)
-            val (r, g, bl) = when (k) {
-                Kind.FIRE -> Triple(230, 110, 40)
-                Kind.JUMP -> Triple(60, 140, 230)
-                Kind.MORPH, Kind.BOOST -> Triple(230, 190, 40)
-                Kind.SCAN -> Triple(60, 200, 140)
-                else -> Triple(40, 40, 50)
-            }
-            fill.color = Color.argb(alpha(if (b.pressed) 230 else 140), r, g, bl)
-            stroke.color = Color.argb(alpha(220), 255, 255, 255)
-            canvas.drawCircle(b.cx, b.cy, b.r, fill)
-            canvas.drawCircle(b.cx, b.cy, b.r, stroke)
-            text.textSize = if (k == Kind.SETTINGS) dp(20f) else min(dp(13f), b.r * 0.55f)
-            text.alpha = alpha(255)
-            canvas.drawText(k.label, b.cx, b.cy + text.textSize * 0.35f, text)
+            if (k == Kind.FIRE) drawFire(canvas, b) else drawOctButton(canvas, b)
         }
     }
 }
