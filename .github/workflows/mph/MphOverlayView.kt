@@ -118,7 +118,7 @@ class MphOverlayView @JvmOverloads constructor(
     private enum class Kind(val label: String) {
         FIRE("FIRE"), JUMP("JUMP"), BOOST("BOOST"), MORPH("BALL"), SCAN("SCAN"),
         BEAM("BEAM"), MISSILE("MSL"), SPECIAL("WPN"), START("START"), MENU("MENU"), SETTINGS("⚙"), BACK("BACK"),
-        QSAVE("SAVE"), QLOAD("LOAD"), FILE("FILE")
+        QSAVE("SAVE"), QLOAD("LOAD"), FILE("FILE"), CHARGE("CHRG")
     }
 
     private class Btn(val kind: Kind, var cx: Float = 0f, var cy: Float = 0f, var r: Float = 0f, var pressed: Boolean = false)
@@ -193,6 +193,23 @@ class MphOverlayView @JvmOverloads constructor(
     private fun touchPlay() { lastPlayInput = SystemClock.uptimeMillis() }
     // FILE popup (SAVE / LOAD) open?
     private var filePopup = false
+
+    // Rapid fire (FIRE) vs plain hold (CHARGE)
+    private var turboRate = prefs.getInt("turbo", 10) // shots per second
+    private var turboHeld = false
+    private var chargeHeld = false
+    private var turboOn = false
+    private var turboNext = 0L
+
+    // Layout editor
+    private var editMode = false
+    private var editSel: Btn? = null
+    private var editDragId = -1
+    private var editOffX = 0f; private var editOffY = 0f
+    private var pinchStartDist = 0f; private var pinchStartR = 0f
+    private val editDone = RectF()
+    private val editReset = RectF()
+    private val defaultR = HashMap<Kind, Float>()
     // Idle stick ring position
     private var stickHintY = 0f
 
@@ -247,6 +264,17 @@ class MphOverlayView @JvmOverloads constructor(
             }
             invalidate() // animate the hold ring
         }
+
+        // Rapid fire: tap L on/off while FIRE is held (CHARGE holding L takes priority).
+        if (turboHeld && !chargeHeld && now >= turboNext) {
+            val period = 1000L / turboRate.coerceIn(4, 15)
+            val onMs = max(34L, period / 2)
+            val offMs = max(34L, period - onMs)
+            if (turboOn) { release(Input.L); turboOn = false; turboNext = now + offMs }
+            else { press(Input.L); turboOn = true; turboNext = now + onMs }
+        }
+
+        if (editMode) return
 
         // 1. Scripted steps (icon taps, gaps) take priority.
         while (queue.isNotEmpty()) {
@@ -404,6 +432,7 @@ class MphOverlayView @JvmOverloads constructor(
         heldDirs.clear()
         roles.clear()
         stickId = -1; aimId = -1; fireId = -1; specialId = -1
+        turboHeld = false; chargeHeld = false; turboOn = false
         fireAiming = false; specialMode = false; directMode = false
         loadHoldStart = 0L
         pendingPressX = AIM_CENTER_X; pendingPressY = AIM_CENTER_Y
@@ -437,6 +466,11 @@ class MphOverlayView @JvmOverloads constructor(
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
+        layoutAll(w, h)
+    }
+
+    private fun layoutAll(w: Int, h: Int) {
+        if (w == 0 || h == 0) return
         val W = w.toFloat(); val H = h.toFloat()
         val pad = dp(6f)
 
@@ -490,8 +524,26 @@ class MphOverlayView @JvmOverloads constructor(
         place(Kind.MORPH, W - m * 0.72f, H * 0.50f, rSmall)
         place(Kind.FIRE, W - m * 0.40f, H * 0.68f, rFire)
         place(Kind.JUMP, W - m * 0.72f, H * 0.88f, rJump)
+        place(Kind.CHARGE, W - m * 0.17f, H * 0.92f, rSmall * 1.1f)
 
         place(Kind.BACK, W - m * 0.5f, H * 0.5f, min(dp(40f), m * 0.35f))
+
+        // Remember defaults, then apply any positions/sizes saved with the layout editor.
+        for (b in buttons.values) {
+            defaultR[b.kind] = b.r
+            val saved = prefs.getString("pos_" + b.kind.name, null) ?: continue
+            val parts = saved.split(",")
+            if (parts.size == 3) {
+                val fx = parts[0].toFloatOrNull(); val fy = parts[1].toFloatOrNull(); val sc = parts[2].toFloatOrNull()
+                if (fx != null && fy != null && sc != null) {
+                    b.cx = fx * W; b.cy = fy * H; b.r = b.r * sc
+                }
+            }
+        }
+
+        // Editor controls, top-centre of the game screen.
+        editReset.set(W / 2f - dp(110f), dp(12f), W / 2f - dp(10f), dp(50f))
+        editDone.set(W / 2f + dp(10f), dp(12f), W / 2f + dp(110f), dp(50f))
 
         // Stop Android's edge-swipe back gesture from stealing thumb drags near the bottom edges.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -507,6 +559,7 @@ class MphOverlayView @JvmOverloads constructor(
 
     private fun visibleKinds(): List<Kind> =
         if (menuMode) listOf(Kind.BACK)
+        else if (editMode) Kind.values().filter { it != Kind.BACK }
         else Kind.values().filter {
             it != Kind.BACK && (filePopup || (it != Kind.QSAVE && it != Kind.QLOAD))
         }
@@ -543,6 +596,7 @@ class MphOverlayView @JvmOverloads constructor(
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
         if (!active) return false
+        if (editMode) { editTouch(event); invalidate(); return true }
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
                 val i = event.actionIndex
@@ -588,11 +642,23 @@ class MphOverlayView @JvmOverloads constructor(
             roles[id] = Role.Button(b.kind)
             b.pressed = true
             when (b.kind) {
-                Kind.FIRE -> {
+                Kind.FIRE, Kind.CHARGE -> {
                     touchPlay()
-                    press(Input.L)
-                    fireId = id; fireDownX = x; fireDownY = y; fireAiming = false
-                    aimLastX = x; aimLastY = y; aimLastT = t
+                    if (b.kind == Kind.FIRE) {
+                        turboHeld = true
+                        if (!chargeHeld) {
+                            press(Input.L); turboOn = true
+                            turboNext = SystemClock.uptimeMillis() + max(34L, 500L / turboRate.coerceIn(4, 15))
+                        }
+                    } else {
+                        chargeHeld = true
+                        press(Input.L)
+                    }
+                    // Whichever of the two lands first can also aim by sliding.
+                    if (fireId == -1) {
+                        fireId = id; fireDownX = x; fireDownY = y; fireAiming = false
+                        aimLastX = x; aimLastY = y; aimLastT = t
+                    }
                 }
                 Kind.JUMP -> { touchPlay(); press(Input.B) }
                 Kind.BOOST -> { touchPlay(); press(Input.R) }
@@ -663,7 +729,7 @@ class MphOverlayView @JvmOverloads constructor(
                 aimLastX = x; aimLastY = y
             }
             is Role.Button -> when (role.kind) {
-                Kind.FIRE -> {
+                Kind.FIRE, Kind.CHARGE -> if (id == fireId) {
                     if (!fireAiming && aimId == -1 && hypot(x - fireDownX, y - fireDownY) > dp(10f)) {
                         fireAiming = true
                         aimLastX = x; aimLastY = y; aimLastT = t
@@ -699,7 +765,18 @@ class MphOverlayView @JvmOverloads constructor(
             is Role.Button -> {
                 buttons.getValue(role.kind).pressed = false
                 when (role.kind) {
-                    Kind.FIRE -> { release(Input.L); fireId = -1; fireAiming = false }
+                    Kind.FIRE -> {
+                        turboHeld = false
+                        if (!chargeHeld) release(Input.L)
+                        turboOn = false
+                        if (id == fireId) { fireId = -1; fireAiming = false }
+                    }
+                    Kind.CHARGE -> {
+                        chargeHeld = false
+                        release(Input.L) // releasing fires the charged shot
+                        if (turboHeld) { turboOn = false; turboNext = SystemClock.uptimeMillis() + 50L }
+                        if (id == fireId) { fireId = -1; fireAiming = false }
+                    }
                     Kind.JUMP -> release(Input.B)
                     Kind.BOOST -> release(Input.R)
                     Kind.START -> release(Input.START)
@@ -758,6 +835,108 @@ class MphOverlayView @JvmOverloads constructor(
     }
 
     // ---------------------------------------------------------------- settings
+
+    // ---------------------------------------------------------------- layout editor
+
+    private fun enterEditMode() {
+        releaseAll()
+        filePopup = false
+        editMode = true
+        editSel = null
+        MelonEmulator.pauseEmulation()
+        invalidate()
+    }
+
+    private fun exitEditMode() {
+        editMode = false
+        editSel = null
+        editDragId = -1
+        MelonEmulator.resumeEmulation()
+        invalidate()
+    }
+
+    private fun saveButton(b: Btn) {
+        val base = defaultR[b.kind] ?: b.r
+        val sc = if (base > 0f) b.r / base else 1f
+        prefs.edit().putString("pos_" + b.kind.name, "${b.cx / width},${b.cy / height},$sc").apply()
+    }
+
+    private fun resetLayout() {
+        val e = prefs.edit()
+        for (k in Kind.values()) e.remove("pos_" + k.name)
+        e.apply()
+        layoutAll(width, height)
+        editSel = null
+    }
+
+    private fun editTouch(event: MotionEvent) {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                val x = event.x; val y = event.y
+                when {
+                    editDone.contains(x, y) -> { exitEditMode(); return }
+                    editReset.contains(x, y) -> { resetLayout(); return }
+                }
+                val b = hit(x, y)
+                editSel = b
+                if (b != null) {
+                    editDragId = event.getPointerId(0)
+                    editOffX = x - b.cx; editOffY = y - b.cy
+                }
+            }
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                val b = editSel ?: return
+                if (event.pointerCount >= 2) {
+                    pinchStartDist = hypot(event.getX(0) - event.getX(1), event.getY(0) - event.getY(1)).coerceAtLeast(1f)
+                    pinchStartR = b.r
+                }
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val b = editSel ?: return
+                if (event.pointerCount >= 2 && pinchStartDist > 0f) {
+                    val d = hypot(event.getX(0) - event.getX(1), event.getY(0) - event.getY(1))
+                    b.r = (pinchStartR * d / pinchStartDist).coerceIn(dp(14f), dp(90f))
+                } else {
+                    val i = event.findPointerIndex(editDragId)
+                    if (i >= 0) {
+                        b.cx = (event.getX(i) - editOffX).coerceIn(b.r, width - b.r)
+                        b.cy = (event.getY(i) - editOffY).coerceIn(b.r, height - b.r)
+                    }
+                }
+            }
+            MotionEvent.ACTION_POINTER_UP -> {
+                pinchStartDist = 0f
+                val b = editSel ?: return
+                // Keep dragging smoothly with whichever finger stays down.
+                val upId = event.getPointerId(event.actionIndex)
+                val remaining = (0 until event.pointerCount).firstOrNull { event.getPointerId(it) != upId }
+                if (remaining != null) {
+                    editDragId = event.getPointerId(remaining)
+                    editOffX = event.getX(remaining) - b.cx; editOffY = event.getY(remaining) - b.cy
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                pinchStartDist = 0f
+                editDragId = -1
+                editSel?.let { saveButton(it) }
+            }
+        }
+    }
+
+    private fun drawEditBar(canvas: Canvas) {
+        fun bar(r: RectF, label: String, c: IntArray) {
+            fill.color = Color.argb(200, 4, 16, 12)
+            canvas.drawRect(r, fill)
+            stroke.strokeWidth = dp(1.8f); stroke.color = col(c, 235)
+            canvas.drawRect(r, stroke)
+            drawLabel(canvas, label, r.centerX(), r.centerY(), dp(13f), c, 255)
+        }
+        fill.color = Color.argb(90, 0, 0, 0)
+        canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), fill)
+        bar(editReset, "RESET", hudAmber)
+        bar(editDone, "DONE", hudGreen)
+        drawLabel(canvas, "DRAG TO MOVE  ·  PINCH TO RESIZE", width / 2f, editDone.bottom + dp(18f), dp(11f), hudGreen, 230)
+    }
 
     // Own quick-save slot in app storage, so it works no matter where melonDS keeps its save states.
     private fun quickState(save: Boolean) {
@@ -854,6 +1033,21 @@ class MphOverlayView @JvmOverloads constructor(
                 override fun onStopTrackingTouch(s: SeekBar?) {}
             })
         }
+        val tLabel = TextView(context)
+        fun tText() = "Rapid fire speed: %d shots/sec".format(turboRate)
+        tLabel.text = tText()
+        val tBar = SeekBar(context).apply {
+            max = 11 // 4 .. 15
+            progress = (turboRate - 4).coerceIn(0, 11)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                    turboRate = 4 + p
+                    tLabel.text = tText()
+                }
+                override fun onStartTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) {}
+            })
+        }
         val opLabel = TextView(context).apply { text = "Button opacity" }
         val opBar = SeekBar(context).apply {
             max = 100
@@ -875,6 +1069,7 @@ class MphOverlayView @JvmOverloads constructor(
         root.addView(vLabel); root.addView(vBar)
         root.addView(aLabel); root.addView(aBar)
         root.addView(smLabel); root.addView(smBar)
+        root.addView(tLabel); root.addView(tBar)
         root.addView(opLabel); root.addView(opBar)
         root.addView(invert)
 
@@ -890,8 +1085,22 @@ class MphOverlayView @JvmOverloads constructor(
                     .putFloat("vsens2", vSens)
                     .putFloat("accel2", accel)
                     .putFloat("smooth", smoothing)
+                    .putInt("turbo", turboRate)
                     .apply()
                 invalidate()
+            }
+            .setNeutralButton("Edit layout") { _, _ ->
+                invertY = invert.isChecked
+                prefs.edit()
+                    .putFloat("sens2", sensitivity)
+                    .putBoolean("invertY", invertY)
+                    .putInt("opacity", opacity)
+                    .putFloat("vsens2", vSens)
+                    .putFloat("accel2", accel)
+                    .putFloat("smooth", smoothing)
+                    .putInt("turbo", turboRate)
+                    .apply()
+                enterEditMode()
             }
             .show()
     }
@@ -936,7 +1145,7 @@ class MphOverlayView @JvmOverloads constructor(
     }
 
     private fun colourFor(k: Kind) = when (k) {
-        Kind.FIRE -> hudAmber
+        Kind.FIRE, Kind.CHARGE -> hudAmber
         Kind.JUMP -> hudCyan
         Kind.MORPH, Kind.BOOST -> hudYellow
         else -> hudGreen
@@ -1049,9 +1258,15 @@ class MphOverlayView @JvmOverloads constructor(
             drawStick(canvas, max(dp(75f), bigRect.left * 0.5f), stickHintY, 0f, 0f, false)
         }
 
+        if (editMode) drawEditBar(canvas)
+
         for (k in visibleKinds()) {
             val b = buttons.getValue(k)
             if (k == Kind.FIRE) drawFire(canvas, b) else drawOctButton(canvas, b)
+            if (editMode && editSel === b) {
+                stroke.strokeWidth = dp(2f); stroke.color = Color.WHITE
+                canvas.drawCircle(b.cx, b.cy, b.r + dp(8f), stroke)
+            }
         }
     }
 }
